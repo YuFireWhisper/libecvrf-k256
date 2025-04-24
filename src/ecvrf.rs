@@ -48,6 +48,16 @@ impl ECVRF {
         }
     }
 
+    pub fn new_from_bytes(secret_key: &[u8]) -> Result<Self, error::Error> {
+        let secret_key =
+            SecretKey::from_slice(secret_key).map_err(|_| error::Error::UnknowError)?;
+        let public_key = PublicKey::from_secret_scalar(&secret_key.to_nonzero_scalar());
+        Ok(ECVRF {
+            secret_key,
+            public_key,
+        })
+    }
+
     /// Ordinary prover
     pub fn prove(&self, alpha: &[u8]) -> Result<ECVRFProof, error::Error> {
         let alpha = Self::generate_alpha(alpha);
