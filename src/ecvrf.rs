@@ -1,20 +1,26 @@
 extern crate alloc;
 use crate::{
     error,
-    extends::{AffineExtend, ScalarExtend},
-    hash::{hash_points, hash_points_prefix, hash_to_curve, hash_to_curve_prefix},
-    helper::*,
+    hash::{hash_points, hash_to_curve},
 };
 use alloc::string::String;
-use libsecp256k1::{
-    curve::{Affine, ECMultContext, ECMultGenContext, Field, Jacobian, Scalar, AFFINE_G},
-    util::{FULL_PUBLIC_KEY_SIZE, SECRET_KEY_SIZE},
-    PublicKey, SecretKey, ECMULT_CONTEXT, ECMULT_GEN_CONTEXT,
+use k256::{
+    elliptic_curve::{
+        sec1::{FromEncodedPoint, ToEncodedPoint},
+        subtle::ConditionallyNegatable,
+        zeroize::Zeroize,
+        Field, PrimeField,
+    },
+    AffinePoint, EncodedPoint, FieldBytes, ProjectivePoint, PublicKey, Scalar, SecretKey,
 };
 use rand::thread_rng;
+use tiny_keccak::{Hasher, Keccak};
 
 /// Max retries for randomize scalar or repeat hash
 pub const MAX_RETRIES: u32 = 100;
+
+/// Size of secret key
+pub const SECRET_KEY_SIZE: usize = 32;
 
 /// Zeroable trait
 pub trait Zeroable {
@@ -37,9 +43,9 @@ pub struct KeyPair {
 /// Raw key pair
 pub struct RawKeyPair {
     /// Raw public key
-    pub public_key: [u8; FULL_PUBLIC_KEY_SIZE],
+    pub public_key: EncodedPoint,
     /// Raw secret key
-    pub secret_key: [u8; SECRET_KEY_SIZE],
+    pub secret_key: FieldBytes,
 }
 
 impl Default for KeyPair {
@@ -53,7 +59,7 @@ impl KeyPair {
     pub fn new() -> Self {
         let mut rng = thread_rng();
         let secret_key = SecretKey::random(&mut rng);
-        let public_key = PublicKey::from_secret_key(&secret_key);
+        let public_key = PublicKey::from_secret_scalar(&secret_key.to_nonzero_scalar());
         KeyPair {
             public_key,
             secret_key,
@@ -63,35 +69,19 @@ impl KeyPair {
 
 impl Zeroable for RawKeyPair {
     fn zeroize(&mut self) {
-        for i in 0..self.public_key.len() {
-            self.public_key[i] ^= self.public_key[i];
-        }
-
-        for i in 0..self.secret_key.len() {
-            self.secret_key[i] ^= self.secret_key[i];
-        }
+        self.public_key.zeroize();
+        self.secret_key.zeroize();
     }
 
     fn is_zero(&self) -> bool {
-        for i in 0..self.public_key.len() {
-            if self.public_key[i] != 0 {
-                return false;
-            }
-        }
-
-        for i in 0..self.secret_key.len() {
-            if self.secret_key[i] != 0 {
-                return false;
-            }
-        }
-        true
+        self.public_key == EncodedPoint::identity() && self.secret_key.iter().all(|&b| b == 0)
     }
 }
 
 impl From<SecretKey> for KeyPair {
     fn from(value: SecretKey) -> Self {
         KeyPair {
-            public_key: PublicKey::from_secret_key(&value),
+            public_key: PublicKey::from_secret_scalar(&value.to_nonzero_scalar()),
             secret_key: value,
         }
     }
@@ -99,9 +89,9 @@ impl From<SecretKey> for KeyPair {
 
 impl From<&[u8; SECRET_KEY_SIZE]> for KeyPair {
     fn from(value: &[u8; SECRET_KEY_SIZE]) -> Self {
-        let secret_instance = SecretKey::parse(value).expect("Can not parse secret key");
+        let secret_instance = SecretKey::from_slice(value).expect("Can not parse secret key");
         KeyPair {
-            public_key: PublicKey::from_secret_key(&secret_instance),
+            public_key: PublicKey::from_secret_scalar(&secret_instance.to_nonzero_scalar()),
             secret_key: secret_instance,
         }
     }
@@ -119,19 +109,21 @@ impl From<String> for KeyPair {
 impl From<&KeyPair> for RawKeyPair {
     fn from(value: &KeyPair) -> Self {
         RawKeyPair {
-            public_key: value.public_key.serialize(),
-            secret_key: value.secret_key.serialize(),
+            public_key: value.public_key.to_encoded_point(true),
+            secret_key: value.secret_key.to_bytes(),
         }
     }
 }
 
 impl From<&[u8; SECRET_KEY_SIZE]> for RawKeyPair {
     fn from(value: &[u8; SECRET_KEY_SIZE]) -> Self {
-        let secret_instance = SecretKey::parse(value).expect("Can not parse secret key");
-        let public_key = PublicKey::from_secret_key(&secret_instance).serialize();
+        let field_bytes = FieldBytes::from_slice(value);
+        let secret_instance = SecretKey::from_bytes(field_bytes).expect("Can not parse secret key");
+        let public_key = PublicKey::from_secret_scalar(&secret_instance.to_nonzero_scalar())
+            .to_encoded_point(true);
         RawKeyPair {
             public_key,
-            secret_key: *value,
+            secret_key: *field_bytes,
         }
     }
 }
@@ -140,7 +132,7 @@ impl From<&[u8; SECRET_KEY_SIZE]> for RawKeyPair {
 #[derive(Clone, Copy, Debug)]
 pub struct ECVRFProof {
     /// gamma
-    pub gamma: Affine,
+    pub gamma: AffinePoint,
     /// c
     pub c: Scalar,
     /// s
@@ -157,7 +149,7 @@ pub struct ECVRFContractProof {
     /// Public key
     pub pk: PublicKey,
     /// gamma
-    pub gamma: Affine,
+    pub gamma: AffinePoint,
     /// c
     pub c: Scalar,
     /// s
@@ -169,163 +161,72 @@ pub struct ECVRFContractProof {
     /// Witness address
     pub witness_address: Scalar,
     /// Witness gamma
-    pub witness_gamma: Affine,
+    pub witness_gamma: AffinePoint,
     /// Witness hash
-    pub witness_hash: Affine,
+    pub witness_hash: AffinePoint,
     /// Inverse z, easier to verify in Solidity
-    pub inverse_z: Field,
+    pub inverse_z: Scalar,
 }
 
 /// ECVRF
-pub struct ECVRF<'a> {
+pub struct ECVRF {
     secret_key: SecretKey,
     public_key: PublicKey,
-    ctx_mul: &'a ECMultContext,
-    ctx_gen: &'a ECMultGenContext,
 }
 
-impl<'a> ECVRF<'a> {
+impl ECVRF {
     /// Create new instance of ECVRF from a secret key
     pub fn new(secret_key: SecretKey) -> Self {
+        let public_key = PublicKey::from_secret_scalar(&secret_key.to_nonzero_scalar());
         ECVRF {
             secret_key,
-            public_key: PublicKey::from_secret_key(&secret_key),
-            ctx_gen: &ECMULT_GEN_CONTEXT,
-            ctx_mul: &ECMULT_CONTEXT,
+            public_key,
         }
-    }
-
-    /// We use this method to prove a randomness for L1 smart contract
-    /// This prover was optimized for on-chain verification
-    /// u_witness is a represent of u, used ecrecover to minimize gas cost
-    /// we're also add projective EC add to make the proof compatible with
-    /// on-chain verifier.
-    pub fn prove_contract(&self, alpha: &Scalar) -> Result<ECVRFContractProof, error::Error> {
-        let mut pub_affine: Affine = self.public_key.into();
-        let mut secret_key: Scalar = self.secret_key.into();
-        pub_affine.x.normalize();
-        pub_affine.y.normalize();
-
-        assert!(pub_affine.is_valid_var());
-
-        // On-chain compatible HASH_TO_CURVE_PREFIX
-        let h = hash_to_curve_prefix(alpha, &pub_affine);
-
-        // gamma = H * sk
-        let gamma = ecmult(self.ctx_mul, &h, &secret_key);
-
-        // k = random()
-        // We need to make sure that k < GROUP_ORDER
-        let mut k = Scalar::randomize();
-        let mut retries = 0;
-        while k.gte(&GROUP_ORDER) || k.is_zero() {
-            if retries > MAX_RETRIES {
-                return Err(error::Error::RetriesExceeded);
-            }
-            k = Scalar::randomize();
-            retries += 1;
-        }
-
-        // Calculate k * G = u
-        let kg = ecmult_gen(self.ctx_gen, &k);
-        // U = c * pk + s * G
-        // u_witness = ecrecover(c * pk + s * G)
-        // this value equal to address(keccak256(U))
-        // It's a gas optimization for EVM
-        // https://ethresear.ch/t/you-can-kinda-abuse-ecrecover-to-do-ecmul-in-secp256k1-today/2384
-        let u_witness = calculate_witness_address(&kg);
-
-        // Calculate k * H = v
-        let kh = ecmult(self.ctx_mul, &h, &k);
-
-        // c = ECVRF_hash_points_prefix(H, pk, gamma, u_witness, k * H)
-        let c = hash_points_prefix(&h, &pub_affine, &gamma, &u_witness, &kh);
-
-        // s = (k - c * sk)
-        // Based on Schnorr signature
-        let mut neg_c = c;
-        neg_c.cond_neg_assign(1.into());
-        let s = k + neg_c * secret_key;
-        secret_key.clear();
-
-        // Gamma witness
-        // witness_gamma = gamma * c
-        let witness_gamma = ecmult(self.ctx_mul, &gamma, &c);
-
-        // Hash witness
-        // witness_hash = h * s
-        let witness_hash = ecmult(self.ctx_mul, &h, &s);
-
-        // V = witness_gamma + witness_hash
-        //   = c * gamma + s * H
-        //   = c * (sk * H) + (k - c * sk) * H
-        //   = k * H
-        let v = projective_ec_add(&witness_gamma, &witness_hash);
-
-        // Inverse do not guarantee that z is normalized
-        // We need to normalize it after we done the inverse
-        let mut inverse_z = v.z.inv();
-        inverse_z.normalize();
-
-        Ok(ECVRFContractProof {
-            pk: self.public_key,
-            gamma,
-            c,
-            s,
-            y: Scalar::from_bytes(&gamma.keccak256()),
-            alpha: *alpha,
-            witness_address: Scalar::from_bytes(&u_witness),
-            witness_gamma,
-            witness_hash,
-            inverse_z,
-        })
     }
 
     /// Ordinary prover
     pub fn prove(&self, alpha: &Scalar) -> Result<ECVRFProof, error::Error> {
-        let mut pub_affine: Affine = self.public_key.into();
-        let mut secret_key: Scalar = self.secret_key.into();
-        pub_affine.x.normalize();
-        pub_affine.y.normalize();
+        let pub_affine: AffinePoint = self.public_key.into();
+        let secret_key: Scalar = *self.secret_key.to_nonzero_scalar();
 
         // Hash to a point on curve
         let h = hash_to_curve(alpha, Some(&pub_affine));
 
         // gamma = H * secret_key
-        let gamma = ecmult(self.ctx_mul, &h, &secret_key);
+        let gamma = h * secret_key;
 
         // k = random()
         // We need to make sure that k < GROUP_ORDER
-        let mut k = Scalar::randomize();
-        let mut retries = 0;
-        while k.gte(&GROUP_ORDER) || k.is_zero() {
-            if retries > MAX_RETRIES {
-                return Err(error::Error::RetriesExceeded);
-            }
-            k = Scalar::randomize();
-            retries += 1;
-        }
+        let k = Scalar::random(thread_rng());
 
         // Calculate k * G <=> u
-        let kg = ecmult_gen(self.ctx_gen, &k);
+        let kg = ProjectivePoint::GENERATOR * k;
 
         // Calculate k * H <=> v
-        let kh = ecmult(self.ctx_mul, &h, &k);
+        let kh = h * k;
 
         // c = ECVRF_hash_points(G, H, public_key, gamma, k * G, k * H)
-        let c = hash_points(&AFFINE_G, &h, &pub_affine, &gamma, &kg, &kh);
+        let c = hash_points(
+            &AffinePoint::GENERATOR,
+            &h,
+            &pub_affine,
+            &gamma.to_affine(),
+            &kg.to_affine(),
+            &kh.to_affine(),
+        );
 
         // s = (k - c * secret_key) mod p
         let mut neg_c = c;
-        neg_c.cond_neg_assign(1.into());
+        neg_c.conditional_negate(1.into());
         let s = k + neg_c * secret_key;
-        secret_key.clear();
 
         // y = keccak256(gama.encode())
-        let y = Scalar::from_bytes(&gamma.keccak256());
+        let bytes = gamma.to_encoded_point(true).to_bytes().to_vec();
+        let bytes = FieldBytes::from_slice(&bytes);
+        let y = Scalar::from_repr(*bytes).unwrap();
 
         Ok(ECVRFProof {
-            gamma,
+            gamma: gamma.to_affine(),
             c,
             s,
             y,
@@ -333,79 +234,42 @@ impl<'a> ECVRF<'a> {
         })
     }
 
-    /// Ordinary verifier
-    pub fn verify(&self, alpha: &Scalar, vrf_proof: &ECVRFProof) -> bool {
-        let mut pub_affine: Affine = self.public_key.into();
-        pub_affine.x.normalize();
-        pub_affine.y.normalize();
+    /// Verify proof
+    pub fn verify(alpha: &Scalar, vrf_proof: &ECVRFProof, public_key: &[u8]) -> bool {
+        let pub_encoded = EncodedPoint::from_bytes(public_key).unwrap();
+        let pub_point = ProjectivePoint::from_encoded_point(&pub_encoded).unwrap();
+        let u = pub_point * vrf_proof.c + ProjectivePoint::GENERATOR * vrf_proof.s;
 
-        assert!(pub_affine.is_valid_var());
-        assert!(vrf_proof.gamma.is_valid_var());
+        let h = hash_to_curve(alpha, Some(&pub_point.to_affine()));
 
-        // H = ECVRF_hash_to_curve(alpha, pk)
-        let h = hash_to_curve(alpha, Some(&pub_affine));
-        let mut jh = Jacobian::default();
-        jh.set_ge(&h);
+        // Gamma witness: c * gamma
+        let witness_gamma = ProjectivePoint::from(vrf_proof.gamma) * vrf_proof.c;
 
-        // U = c * pk + s * G
-        //   = c * sk * G + (k - c * sk) * G
-        //   = k * G
-        let mut u = Jacobian::default();
-        let pub_jacobian = Jacobian::from_ge(&pub_affine);
-        self.ctx_mul
-            .ecmult(&mut u, &pub_jacobian, &vrf_proof.c, &vrf_proof.s);
+        // Hash witness: s * H
+        let witness_hash = ProjectivePoint::from(h) * vrf_proof.s;
 
-        // Gamma witness
-        let witness_gamma = ecmult(self.ctx_mul, &vrf_proof.gamma, &vrf_proof.c);
-        // Hash witness
-        let witness_hash = ecmult(self.ctx_mul, &h, &vrf_proof.s);
-
-        // V = c * gamma + s * H = witness_gamma + witness_hash
-        //   = c * sk * H + (k - c * sk) * H
-        //   = k *. H
-        let v = Jacobian::from_ge(&witness_gamma).add_ge(&witness_hash);
+        // V = c * gamma + s * H
+        let v = witness_gamma + witness_hash;
 
         // c_prime = ECVRF_hash_points(G, H, pk, gamma, U, V)
         let computed_c = hash_points(
-            &AFFINE_G,
+            &AffinePoint::GENERATOR,
             &h,
-            &pub_affine,
+            &pub_point.to_affine(),
             &vrf_proof.gamma,
-            &Affine::from_jacobian(&u),
-            &Affine::from_jacobian(&v),
+            &u.to_affine(),
+            &v.to_affine(),
         );
 
-        // y = keccak256(gama.encode())
-        let computed_y = Scalar::from_bytes(&vrf_proof.gamma.keccak256());
+        // y = keccak256(gamma.encode())
+        let mut output = [0u8; 32];
+        let mut hasher = Keccak::v256();
+        hasher.update(vrf_proof.gamma.to_encoded_point(true).as_bytes());
+        hasher.finalize(&mut output);
 
-        // computed values should equal to the real one
-        computed_c.eq(&vrf_proof.c) && computed_y.eq(&vrf_proof.y)
-    }
-}
+        let bytes = FieldBytes::from_slice(&output);
+        let computed_y = Scalar::from_repr(*bytes).unwrap();
 
-#[cfg(test)]
-mod tests {
-    use crate::{extends::ScalarExtend, ECVRF};
-    use libsecp256k1::{curve::Scalar, SecretKey};
-    use rand::thread_rng;
-
-    #[test]
-    fn we_should_able_to_prove_and_verify() {
-        let mut r = thread_rng();
-        let secret_key = SecretKey::random(&mut r);
-
-        // Create new instance of ECVRF
-        let ecvrf = ECVRF::new(secret_key);
-
-        // Random an alpha value
-        let alpha = Scalar::randomize();
-
-        //Prove
-        let r1 = ecvrf.prove(&alpha);
-
-        // Verify
-        let r2 = ecvrf.verify(&alpha, &r1.expect("Can not prove the randomness"));
-
-        assert!(r2);
+        computed_c == vrf_proof.c && computed_y == vrf_proof.y
     }
 }

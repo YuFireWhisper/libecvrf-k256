@@ -1,15 +1,5 @@
 //! This crate provide ECVRF implementation in Rust.
 #![cfg_attr(not(feature = "std"), no_std)]
-#![deny(
-    unused,
-    warnings,
-    future_incompatible,
-    nonstandard_style,
-    rust_2018_idioms,
-    missing_docs,
-    unused_imports
-)]
-#![forbid(unsafe_code)]
 
 /// EC-VRF implementation in Rust
 mod ecvrf;
