@@ -11,10 +11,14 @@ use k256::{
     },
     AffinePoint, EncodedPoint, FieldBytes, ProjectivePoint, PublicKey, Scalar, SecretKey,
 };
+use serde::{Deserialize, Serialize};
 use tiny_keccak::{Hasher, Keccak};
 
 /// EC-VRF proof
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
+#[derive(Debug)]
+#[derive(Eq, PartialEq)]
+#[derive(Serialize, Deserialize)]
 pub struct ECVRFProof {
     /// gamma
     pub gamma: AffinePoint,
