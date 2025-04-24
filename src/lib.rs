@@ -8,9 +8,6 @@ pub use ecvrf::*;
 /// EC-VRF error handling
 pub mod error;
 
-/// Extended Affine, Jacobian, Scalar, Field
-pub mod extends;
-
 /// Curve hash
 pub mod hash;
 
