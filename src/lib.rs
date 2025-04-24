@@ -10,16 +10,3 @@ pub mod error;
 
 /// Curve hash
 pub mod hash;
-
-/// Helper functions
-pub mod helper;
-
-/// Re-export libsecp256k1
-pub mod secp256k1 {
-    pub use libsecp256k1::*;
-}
-
-/// Re-export rand::thread_rng
-pub mod util {
-    pub use rand::thread_rng;
-}
