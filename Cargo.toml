@@ -16,7 +16,7 @@ fork_from = "libecvrf"
 fork_from_repository = "https://github.com/orochi-network/orochimaru"
 
 [lib]
-name = "libecvrf"
+name = "libecvrf-k256"
 path = "src/lib.rs"
 
 [dependencies]
