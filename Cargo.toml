@@ -1,0 +1,33 @@
+[package]
+name = "libecvrf-k256"
+version = "1.1.2"
+description = "A fork of libecvrf use k256 implementation"
+authors = []
+edition = "2021"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["vrf", "ecvrf", "libecvrf", "randomness", "rng"]
+categories = ["no-std", "cryptography", "algorithms"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[package.metadata]
+fork_from = "libecvrf"
+fork_from_repository = "https://github.com/orochi-network/orochimaru"
+
+[lib]
+name = "libecvrf"
+path = "src/lib.rs"
+
+[dependencies]
+tiny-keccak = { version = "2.0.2", default-features = false, features = [
+  "keccak",
+] }
+libsecp256k1 = "0.7.1"
+rand = "0.8.5"
+hex = "0.4"
+
+[features]
+default = ["no_std"]
+std = []
+no_std = []
